@@ -1,0 +1,47 @@
+repositories:
+  - name: user-service
+    path: ../user-service
+    type: backend
+    api_contract_patterns:
+      - "*.proto"
+      - "api/**/*.yaml"
+      - "api/**/*.yml"
+      - "openapi/*.json"
+    shared_model_patterns:
+      - "models/**/*.py"
+      - "dto/**/*.py"
+      - "schemas/**/*.py"
+
+  - name: order-service
+    path: ../order-service
+    type: backend
+    api_contract_patterns:
+      - "*.proto"
+      - "api/**/*.yaml"
+      - "api/**/*.yml"
+    shared_model_patterns:
+      - "models/**/*.go"
+      - "schemas/**/*.go"
+
+  - name: web-frontend
+    path: ../web-frontend
+    type: frontend
+    api_contract_patterns:
+      - "src/api/**/*.ts"
+      - "openapi/*.json"
+    shared_model_patterns:
+      - "src/types/**/*.ts"
+      - "src/models/**/*.ts"
+
+dependency_rules:
+  - from: user-service
+    to: order-service
+    reason: "订单服务依赖用户服务的用户信息API"
+  
+  - from: user-service
+    to: web-frontend
+    reason: "前端依赖用户服务的登录和用户信息接口"
+
+  - from: order-service
+    to: web-frontend
+    reason: "前端依赖订单服务的订单查询和创建接口"
