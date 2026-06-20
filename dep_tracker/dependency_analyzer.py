@@ -4,12 +4,22 @@
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
 from .change_detector import ChangeAnalysis
-from .config import AppConfig, DependencyRule
+from .config import (
+    AppConfig,
+    DependencyRule,
+    CHANGE_ROLE_PROVIDER,
+    CHANGE_ROLE_CONSUMER,
+    CHANGE_ROLE_BOTH,
+    CHANGE_ROLE_UNKNOWN,
+    INFERENCE_SOURCE_STATIC,
+    INFERENCE_SOURCE_DYNAMIC,
+    INFERENCE_SOURCE_HYBRID,
+)
 
 
 @dataclass
@@ -22,6 +32,9 @@ class DependencyEdge:
     has_api_change: bool = False
     has_model_change: bool = False
     has_breaking_change: bool = False
+    inference_source: str = INFERENCE_SOURCE_STATIC
+    confidence: float = 1.0
+    shared_items: Set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -100,6 +113,7 @@ class DependencyAnalyzer:
 
     def __init__(self, config: AppConfig):
         self.config = config
+        self._dynamic_warnings: List[str] = []
 
     def analyze(
         self,
@@ -107,6 +121,8 @@ class DependencyAnalyzer:
         change_analysis: Dict[str, ChangeAnalysis]
     ) -> DependencyAnalysis:
         """执行依赖分析"""
+        self._dynamic_warnings = []
+        
         topology = self._build_topology(change_analysis)
         
         has_circular = False
@@ -127,6 +143,22 @@ class DependencyAnalyzer:
         repos_without_changes = list(all_repo_names - set(changed_repos))
 
         warnings = self._generate_warnings(topology, change_analysis)
+        
+        for dyn_warning in self._dynamic_warnings:
+            if dyn_warning not in warnings:
+                warnings.append(dyn_warning)
+        
+        dynamic_edges = [
+            edge for edge in topology.edges
+            if edge.inference_source in (INFERENCE_SOURCE_DYNAMIC, INFERENCE_SOURCE_HYBRID)
+        ]
+        if dynamic_edges:
+            info_msg = (
+                f"动态推断了 {len(dynamic_edges)} 条依赖关系 "
+                f"(动态: {sum(1 for e in dynamic_edges if e.inference_source == INFERENCE_SOURCE_DYNAMIC)}, "
+                f"混合: {sum(1 for e in dynamic_edges if e.inference_source == INFERENCE_SOURCE_HYBRID)})"
+            )
+            warnings.insert(0, f"ℹ️  {info_msg}")
 
         return DependencyAnalysis(
             issue_id=issue_id,
@@ -172,7 +204,10 @@ class DependencyAnalyzer:
         topology: TopologyGraph,
         change_analysis: Dict[str, ChangeAnalysis]
     ):
-        """根据配置的依赖规则构建边"""
+        """根据静态配置的依赖规则构建边
+        
+        静态配置依赖与动态推断完全解耦，各自独立计算。
+        """
         for rule in self.config.dependency_rules:
             from_analysis = change_analysis.get(rule.from_repo)
             to_analysis = change_analysis.get(rule.to_repo)
@@ -191,56 +226,359 @@ class DependencyAnalyzer:
                 has_api_change=from_analysis.has_api_changes if from_analysis else False,
                 has_model_change=from_analysis.has_model_changes if from_analysis else False,
                 has_breaking_change=from_analysis.has_breaking_changes if from_analysis else False,
+                inference_source=INFERENCE_SOURCE_STATIC,
+                confidence=1.0,
             )
             
             existing_edge = topology.get_edge(rule.from_repo, rule.to_repo)
             if existing_edge:
+                if existing_edge.inference_source == INFERENCE_SOURCE_DYNAMIC:
+                    existing_edge.inference_source = INFERENCE_SOURCE_HYBRID
                 existing_edge.weight += 1
+                existing_edge.confidence = min(1.0, existing_edge.confidence + 0.2)
                 existing_edge.has_api_change = existing_edge.has_api_change or edge.has_api_change
                 existing_edge.has_model_change = existing_edge.has_model_change or edge.has_model_change
                 existing_edge.has_breaking_change = existing_edge.has_breaking_change or edge.has_breaking_change
+                if rule.reason and rule.reason not in existing_edge.reason:
+                    existing_edge.reason = f"{existing_edge.reason}; {rule.reason}" if existing_edge.reason else rule.reason
             else:
                 topology.add_edge(edge)
+
+    def _classify_repo_role(
+        self,
+        repo_name: str,
+        analysis: ChangeAnalysis
+    ) -> Tuple[str, Dict[str, Any]]:
+        """根据变更特征分类仓库角色
+        
+        Args:
+            repo_name: 仓库名称
+            analysis: 变更分析结果
+        
+        Returns:
+            (role, features) - 角色和特征字典
+        """
+        repo_config = self.config.get_repo(repo_name)
+        features: Dict[str, Any] = {
+            'repo_type': repo_config.type if repo_config else 'unknown',
+            'has_api_changes': analysis.has_api_changes,
+            'has_model_changes': analysis.has_model_changes,
+            'has_breaking_changes': analysis.has_breaking_changes,
+            'module_hierarchy': repo_config.module_hierarchy if repo_config else None,
+            'provides_api': repo_config.provides_api if repo_config else False,
+            'consumes_api': repo_config.consumes_api if repo_config else False,
+            'affected_items': analysis.all_affected_items,
+            'commit_count': len(analysis.commits),
+        }
+        
+        api_keywords = ['Service:', 'RPC:', 'Path:', 'Schema:']
+        model_keywords = ['Class:', 'Struct:', 'Type:', 'Message:']
+        
+        has_api_defs = any(
+            any(kw in item for kw in api_keywords)
+            for item in analysis.all_affected_items
+        )
+        
+        has_model_defs = any(
+            any(kw in item for kw in model_keywords)
+            for item in analysis.all_affected_items
+        )
+        
+        features['has_api_definitions'] = has_api_defs
+        features['has_model_definitions'] = has_model_defs
+        
+        repo_type = features['repo_type']
+        is_frontend = repo_type == 'frontend' or 'frontend' in repo_name.lower()
+        is_backend = repo_type == 'backend' or 'service' in repo_name.lower()
+        
+        if features['provides_api'] or (is_backend and has_api_defs):
+            if features['consumes_api'] or (is_frontend and has_model_defs and not has_api_defs):
+                role = CHANGE_ROLE_BOTH
+            else:
+                role = CHANGE_ROLE_PROVIDER
+        elif features['consumes_api'] or (is_frontend and has_model_defs and not has_api_defs):
+            role = CHANGE_ROLE_CONSUMER
+        else:
+            role = CHANGE_ROLE_UNKNOWN
+        
+        features['is_frontend'] = is_frontend
+        features['is_backend'] = is_backend
+        
+        return role, features
+
+    def _calculate_direction_score(
+        self,
+        from_role: str,
+        from_features: Dict[str, Any],
+        to_role: str,
+        to_features: Dict[str, Any],
+        shared_items: Set[str]
+    ) -> Tuple[int, float, str]:
+        """计算依赖方向得分
+        
+        Args:
+            from_role: 候选源仓库角色
+            from_features: 候选源仓库特征
+            to_role: 候选目标仓库角色
+            to_features: 候选目标仓库特征
+            shared_items: 共享变更项
+        
+        Returns:
+            (direction, confidence, reason) - 方向: 1=from→to, -1=to→from, 0=无法确定
+        """
+        score_forward = 0.0
+        score_backward = 0.0
+        reasons = []
+        
+        if from_features['has_api_definitions'] and not to_features['has_api_definitions']:
+            score_forward += 2.0
+            reasons.append("源仓库定义API，目标仓库未定义API")
+        elif to_features['has_api_definitions'] and not from_features['has_api_definitions']:
+            score_backward += 2.0
+            reasons.append("目标仓库定义API，源仓库未定义API")
+        
+        if from_role == CHANGE_ROLE_PROVIDER and to_role == CHANGE_ROLE_CONSUMER:
+            score_forward += 3.0
+            reasons.append("提供者→消费者")
+        elif to_role == CHANGE_ROLE_PROVIDER and from_role == CHANGE_ROLE_CONSUMER:
+            score_backward += 3.0
+            reasons.append("消费者→提供者")
+        
+        if from_features['is_backend'] and to_features['is_frontend']:
+            score_forward += 2.5
+            reasons.append("后端→前端")
+        elif to_features['is_backend'] and from_features['is_frontend']:
+            score_backward += 2.5
+            reasons.append("前端→后端")
+        
+        hierarchy_a = from_features.get('module_hierarchy')
+        hierarchy_b = to_features.get('module_hierarchy')
+        if hierarchy_a is not None and hierarchy_b is not None:
+            if hierarchy_a < hierarchy_b:
+                score_forward += 1.5
+                reasons.append(f"模块层级 {hierarchy_a} → {hierarchy_b}")
+            elif hierarchy_b < hierarchy_a:
+                score_backward += 1.5
+                reasons.append(f"模块层级 {hierarchy_b} → {hierarchy_a}")
+        
+        shared_api = sum(
+            1 for item in shared_items
+            if any(kw in item for kw in ['Service:', 'RPC:', 'Path:'])
+        )
+        shared_model = sum(
+            1 for item in shared_items
+            if any(kw in item for kw in ['Class:', 'Struct:', 'Type:', 'Message:'])
+        )
+        
+        if shared_api > 0:
+            if from_features['has_api_definitions']:
+                score_forward += 1.0 * shared_api
+            if to_features['has_api_definitions']:
+                score_backward += 1.0 * shared_api
+        
+        if shared_model > 0:
+            if from_features['has_model_definitions'] and not to_features['has_model_definitions']:
+                score_forward += 0.5 * shared_model
+            elif to_features['has_model_definitions'] and not from_features['has_model_definitions']:
+                score_backward += 0.5 * shared_model
+        
+        from_commits = from_features.get('commit_count', 0)
+        to_commits = to_features.get('commit_count', 0)
+        if from_commits > to_commits and from_commits > 1:
+            score_forward += 0.3
+        elif to_commits > from_commits and to_commits > 1:
+            score_backward += 0.3
+        
+        total_score = abs(score_forward - score_backward)
+        max_score = max(score_forward, score_backward, 1.0)
+        confidence = min(1.0, total_score / max_score) if max_score > 0 else 0.5
+        
+        if score_forward > score_backward and total_score >= 0.5:
+            return 1, confidence, "; ".join(reasons) if reasons else "基于变更特征推断"
+        elif score_backward > score_forward and total_score >= 0.5:
+            return -1, confidence, "; ".join(reasons) if reasons else "基于变更特征推断"
+        else:
+            return 0, confidence, "无法确定方向，建议人工检查"
+
+    def _infer_dependency_direction(
+        self,
+        repo_a: str,
+        repo_b: str,
+        analysis_a: ChangeAnalysis,
+        analysis_b: ChangeAnalysis,
+        shared_items: Set[str]
+    ) -> Tuple[Optional[str], Optional[str], float, str]:
+        """智能推断两个仓库之间的依赖方向
+        
+        完全基于变更特征，不依赖静态配置规则。
+        
+        Args:
+            repo_a: 仓库A名称
+            repo_b: 仓库B名称
+            analysis_a: 仓库A的变更分析
+            analysis_b: 仓库B的变更分析
+            shared_items: 共享变更项
+        
+        Returns:
+            (from_repo, to_repo, confidence, reason) - 推断出的依赖方向和置信度
+        """
+        role_a, features_a = self._classify_repo_role(repo_a, analysis_a)
+        role_b, features_b = self._classify_repo_role(repo_b, analysis_b)
+        
+        direction, confidence, reason = self._calculate_direction_score(
+            role_a, features_a,
+            role_b, features_b,
+            shared_items
+        )
+        
+        if direction == 1:
+            return repo_a, repo_b, confidence, reason
+        elif direction == -1:
+            return repo_b, repo_a, confidence, reason
+        else:
+            if features_a.get('module_hierarchy') and features_b.get('module_hierarchy'):
+                if features_a['module_hierarchy'] < features_b['module_hierarchy']:
+                    return repo_a, repo_b, 0.6, "基于模块层级默认推断"
+                else:
+                    return repo_b, repo_a, 0.6, "基于模块层级默认推断"
+            
+            if features_a.get('is_backend') and features_b.get('is_frontend'):
+                return repo_a, repo_b, 0.7, "默认后端→前端"
+            elif features_b.get('is_backend') and features_a.get('is_frontend'):
+                return repo_b, repo_a, 0.7, "默认后端→前端"
+            
+            return None, None, confidence, reason
+
+    def _normalize_item_name(self, item: str) -> str:
+        """规范化项名称，移除前缀（Class:, Type:, Service:, RPC:, API:, etc.）
+        
+        这样可以跨仓库匹配相同的逻辑实体，即使前缀不同。
+        """
+        parts = item.split(': ', 1)
+        if len(parts) == 2:
+            return parts[1].strip()
+        return item.strip()
+
+    def _find_shared_items(
+        self,
+        analysis_a: ChangeAnalysis,
+        analysis_b: ChangeAnalysis
+    ) -> Set[str]:
+        """智能查找两个仓库之间的共享变更项
+        
+        支持跨前缀匹配：Class: UserModel == Type: UserModel
+        并优先返回analysis_a中的完整项名用于显示。
+        """
+        normalized_a = {}
+        for item in analysis_a.all_affected_items:
+            normalized = self._normalize_item_name(item)
+            if normalized:
+                normalized_a[normalized] = item
+        
+        normalized_b = {}
+        for item in analysis_b.all_affected_items:
+            normalized = self._normalize_item_name(item)
+            if normalized:
+                normalized_b[normalized] = item
+        
+        shared_names = set(normalized_a.keys()) & set(normalized_b.keys())
+        
+        shared_items = set()
+        for name in shared_names:
+            item_a = normalized_a.get(name, name)
+            item_b = normalized_b.get(name, name)
+            shared_items.add(item_a)
+            shared_items.add(item_b)
+        
+        return shared_items
 
     def _build_edges_from_changes(
         self,
         topology: TopologyGraph,
         change_analysis: Dict[str, ChangeAnalysis]
     ):
-        """根据变更内容推断依赖关系"""
+        """基于变更特征动态推断依赖关系
+        
+        与静态配置完全解耦，不强制要求共享变更项必须命中配置规则。
+        基于变更特征（API提供者/消费者、模块层级、仓库类型等）智能推断DAG方向。
+        """
         changed_repos = [
             repo for repo, analysis in change_analysis.items()
             if analysis.has_changes
         ]
 
-        for i, from_repo in enumerate(changed_repos):
-            from_analysis = change_analysis[from_repo]
+        dynamic_warnings = []
+
+        for i, repo_a in enumerate(changed_repos):
+            analysis_a = change_analysis[repo_a]
             
-            for to_repo in changed_repos[i + 1:]:
-                to_analysis = change_analysis[to_repo]
+            for repo_b in changed_repos[i + 1:]:
+                analysis_b = change_analysis[repo_b]
                 
-                shared_items = from_analysis.all_affected_items & to_analysis.all_affected_items
-                if shared_items:
-                    inferred_rule = self._find_matching_rule(from_repo, to_repo)
-                    if inferred_rule:
-                        edge = DependencyEdge(
-                            from_repo=inferred_rule.from_repo,
-                            to_repo=inferred_rule.to_repo,
-                            reason=f"共享变更项: {', '.join(list(shared_items)[:3])}",
-                            weight=2,
-                            has_api_change=from_analysis.has_api_changes,
-                            has_model_change=from_analysis.has_model_changes,
-                            has_breaking_change=from_analysis.has_breaking_changes or to_analysis.has_breaking_changes,
-                        )
-                        
-                        existing_edge = topology.get_edge(edge.from_repo, edge.to_repo)
-                        if existing_edge:
-                            existing_edge.weight += 1
-                        else:
-                            topology.add_edge(edge)
+                shared_items = self._find_shared_items(analysis_a, analysis_b)
+                if not shared_items:
+                    continue
+                
+                existing_edge_ab = topology.get_edge(repo_a, repo_b)
+                existing_edge_ba = topology.get_edge(repo_b, repo_a)
+                has_static_edge = existing_edge_ab is not None or existing_edge_ba is not None
+                
+                if has_static_edge:
+                    if existing_edge_ab and existing_edge_ab.inference_source == INFERENCE_SOURCE_STATIC:
+                        existing_edge_ab.inference_source = INFERENCE_SOURCE_HYBRID
+                        existing_edge_ab.shared_items.update(shared_items)
+                    if existing_edge_ba and existing_edge_ba.inference_source == INFERENCE_SOURCE_STATIC:
+                        existing_edge_ba.inference_source = INFERENCE_SOURCE_HYBRID
+                        existing_edge_ba.shared_items.update(shared_items)
+                
+                from_repo, to_repo, confidence, reason = self._infer_dependency_direction(
+                    repo_a, repo_b,
+                    analysis_a, analysis_b,
+                    shared_items
+                )
+                
+                if from_repo is None or to_repo is None:
+                    warning_msg = (
+                        f"仓库 {repo_a} 和 {repo_b} 共享 {len(shared_items)} 个变更项，"
+                        f"但无法确定依赖方向。建议添加静态依赖规则。"
+                        f"共享项: {', '.join(list(shared_items)[:3])}"
+                    )
+                    dynamic_warnings.append(warning_msg)
+                    continue
+                
+                edge = DependencyEdge(
+                    from_repo=from_repo,
+                    to_repo=to_repo,
+                    reason=f"共享变更项: {', '.join(list(shared_items)[:3])}; {reason}",
+                    weight=2,
+                    has_api_change=analysis_a.has_api_changes or analysis_b.has_api_changes,
+                    has_model_change=analysis_a.has_model_changes or analysis_b.has_model_changes,
+                    has_breaking_change=analysis_a.has_breaking_changes or analysis_b.has_breaking_changes,
+                    inference_source=INFERENCE_SOURCE_DYNAMIC if not has_static_edge else INFERENCE_SOURCE_HYBRID,
+                    confidence=confidence,
+                    shared_items=shared_items,
+                )
+                
+                existing_edge = topology.get_edge(from_repo, to_repo)
+                opposite_edge = topology.get_edge(to_repo, from_repo)
+                
+                if existing_edge:
+                    existing_edge.weight += 1
+                    if existing_edge.inference_source == INFERENCE_SOURCE_DYNAMIC and has_static_edge:
+                        existing_edge.inference_source = INFERENCE_SOURCE_HYBRID
+                    existing_edge.confidence = min(1.0, (existing_edge.confidence + confidence) / 2)
+                    existing_edge.shared_items.update(shared_items)
+                    if reason and reason not in existing_edge.reason:
+                        existing_edge.reason = f"{existing_edge.reason}; {reason}" if existing_edge.reason else reason
+                else:
+                    topology.add_edge(edge)
+        
+        for warning in dynamic_warnings:
+            if warning not in self._dynamic_warnings:
+                self._dynamic_warnings.append(warning)
 
     def _find_matching_rule(self, repo_a: str, repo_b: str) -> Optional[DependencyRule]:
-        """查找匹配的依赖规则方向"""
+        """查找匹配的依赖规则方向（保留用于兼容，不强制使用）"""
         for rule in self.config.dependency_rules:
             if (rule.from_repo == repo_a and rule.to_repo == repo_b):
                 return rule

@@ -15,6 +15,11 @@ from .dependency_analyzer import (
     RepositoryNode,
     TopologyGraph,
 )
+from .config import (
+    INFERENCE_SOURCE_STATIC,
+    INFERENCE_SOURCE_DYNAMIC,
+    INFERENCE_SOURCE_HYBRID,
+)
 from .git_scanner import RepoScanResult
 
 init(autoreset=True)
@@ -199,6 +204,7 @@ class TerminalVisualizer:
         lines.append(self._color("  图例:", Fore.LIGHTBLACK_EX))
         lines.append(f"    {self._color('✓', Fore.GREEN)} 有变更  {self._color('⚠️', Fore.RED)} 含破坏性变更  {self._color('○', Fore.LIGHTBLACK_EX)} 无变更")
         lines.append(f"    {self.BOX_CHARS['arrow']} 依赖关系  {self.BOX_CHARS['arrow_bold']} 含 API/模型变更的依赖")
+        lines.append(f"    {self._color('[S]', Fore.LIGHTBLACK_EX)} 静态配置  {self._color('[D]', Fore.CYAN)} 动态推断  {self._color('[H]', Fore.MAGENTA)} 混合模式")
         lines.append("")
 
         return "\n".join(lines)
@@ -262,9 +268,20 @@ class TerminalVisualizer:
                     arrow = self.BOX_CHARS['arrow_bold'] if (edge.has_api_change or edge.has_model_change) else self.BOX_CHARS['arrow']
                     edge_color = Fore.RED if edge.has_breaking_change else Fore.LIGHTBLACK_EX
                     
+                    source_tag = self._get_inference_source_tag(edge)
+                    
                     line = f"{prefix}{self.BOX_CHARS['vertical']}"
                     line += f" {self._color(arrow, edge_color)} "
                     line += self._color(to_repo, Fore.WHITE)
+                    line += f" {source_tag}"
+                    
+                    if hasattr(edge, 'confidence') and edge.confidence < 1.0:
+                        confidence_pct = int(edge.confidence * 100)
+                        if confidence_pct < 70:
+                            conf_color = Fore.YELLOW
+                        else:
+                            conf_color = Fore.LIGHTBLACK_EX
+                        line += self._color(f" [{confidence_pct}%]", conf_color)
                     
                     if self.config.show_reason and edge.reason:
                         reason_text = edge.reason
@@ -277,6 +294,21 @@ class TerminalVisualizer:
                 lines.append(f"{prefix}{self.BOX_CHARS['vertical']}")
         
         return lines
+
+    def _get_inference_source_tag(self, edge: DependencyEdge) -> str:
+        """获取推断来源标签"""
+        if not hasattr(edge, 'inference_source'):
+            return ""
+        
+        source = edge.inference_source
+        if source == INFERENCE_SOURCE_STATIC:
+            return self._color("[S]", Fore.LIGHTBLACK_EX)
+        elif source == INFERENCE_SOURCE_DYNAMIC:
+            return self._color("[D]", Fore.CYAN)
+        elif source == INFERENCE_SOURCE_HYBRID:
+            return self._color("[H]", Fore.MAGENTA)
+        else:
+            return ""
 
     def render_release_order(self, release_steps: List[ReleaseStep]) -> str:
         """渲染发布顺序"""

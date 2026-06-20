@@ -19,6 +19,9 @@ class RepositoryConfig:
     type: str = "backend"
     api_contract_patterns: List[str] = field(default_factory=list)
     shared_model_patterns: List[str] = field(default_factory=list)
+    module_hierarchy: Optional[int] = None
+    provides_api: bool = False
+    consumes_api: bool = False
 
     def resolve_path(self, base_dir: Optional[str] = None) -> str:
         """解析仓库路径为绝对路径"""
@@ -26,6 +29,16 @@ class RepositoryConfig:
         if not path.is_absolute() and base_dir:
             path = Path(base_dir) / path
         return str(path.resolve())
+
+
+CHANGE_ROLE_PROVIDER = "provider"
+CHANGE_ROLE_CONSUMER = "consumer"
+CHANGE_ROLE_BOTH = "both"
+CHANGE_ROLE_UNKNOWN = "unknown"
+
+INFERENCE_SOURCE_STATIC = "static_config"
+INFERENCE_SOURCE_DYNAMIC = "dynamic_inference"
+INFERENCE_SOURCE_HYBRID = "hybrid"
 
 
 @dataclass
