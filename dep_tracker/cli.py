@@ -76,7 +76,19 @@ class DepTrackerCLI:
         click.echo("")
 
         repo_paths = {repo.name: repo.path for repo in self.config.repositories}
-        change_analysis = self.detector.detect_all_changes(scan_results, repo_paths)
+        
+        repos_by_path = self.scanner.get_all_repos()
+        git_repos = {}
+        for repo_config in self.config.repositories:
+            git_repo = repos_by_path.get(repo_config.path)
+            if git_repo:
+                git_repos[repo_config.name] = git_repo
+        
+        change_analysis = self.detector.detect_all_changes(
+            scan_results,
+            repo_paths,
+            git_repos
+        )
 
         click.echo(f"{Fore.CYAN}📊 正在分析依赖关系...{Style.RESET_ALL}")
         analysis = self.analyzer.analyze(issue_id, change_analysis)

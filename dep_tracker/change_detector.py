@@ -7,9 +7,11 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime
 
 import yaml
+from git import Repo
 
 from .git_scanner import CommitInfo, RepoScanResult
 
@@ -84,9 +86,16 @@ class ChangeDetector:
     def detect_changes(
         self,
         scan_result: RepoScanResult,
-        repo_path: str
+        repo_path: str,
+        git_repo: Optional[Repo] = None
     ) -> ChangeAnalysis:
-        """检测仓库的详细变更"""
+        """检测仓库的详细变更
+        
+        Args:
+            scan_result: 仓库扫描结果
+            repo_path: 仓库路径（工作树路径）
+            git_repo: GitPython Repo 对象（可选，用于从 tree object 读取不在工作树中的文件）
+        """
         analysis = ChangeAnalysis(
             repo_name=scan_result.repo_name,
             commits=scan_result.commits,
@@ -103,7 +112,8 @@ class ChangeDetector:
             change = self._analyze_contract_file(
                 file_path,
                 repo_path,
-                all_changed_files.get(file_path, [])
+                all_changed_files.get(file_path, []),
+                git_repo
             )
             if change:
                 analysis.api_contract_changes.append(change)
@@ -112,45 +122,142 @@ class ChangeDetector:
             change = self._analyze_model_file(
                 file_path,
                 repo_path,
-                all_changed_files.get(file_path, [])
+                all_changed_files.get(file_path, []),
+                git_repo
             )
             if change:
                 analysis.shared_model_changes.append(change)
 
         return analysis
 
+    def _read_file_from_tree(
+        self,
+        git_repo: Repo,
+        commit_hash: str,
+        file_path: str
+    ) -> Optional[str]:
+        """从 commit 的 tree object 中读取文件内容
+        
+        当文件不在当前工作树中时，使用此方法从指定 commit 的 tree 中读取。
+        
+        Args:
+            git_repo: GitPython Repo 对象
+            commit_hash: commit 的哈希值
+            file_path: 文件在仓库中的相对路径
+        
+        Returns:
+            文件内容字符串，如果读取失败返回 None
+        """
+        try:
+            commit = git_repo.commit(commit_hash)
+            
+            try:
+                tree_entry = commit.tree[file_path]
+            except (KeyError, IndexError):
+                tree_entry = None
+                try:
+                    for entry in commit.tree.traverse():
+                        if hasattr(entry, 'path') and entry.path == file_path:
+                            tree_entry = entry
+                            break
+                except Exception:
+                    pass
+            
+            if tree_entry is None:
+                normalized_path = file_path.replace('\\', '/')
+                for entry in commit.tree.traverse():
+                    try:
+                        entry_path = entry.path.replace('\\', '/')
+                        if entry_path == normalized_path:
+                            tree_entry = entry
+                            break
+                    except Exception:
+                        continue
+            
+            if tree_entry and tree_entry.type == 'blob':
+                blob_data = tree_entry.data_stream.read()
+                try:
+                    return blob_data.decode('utf-8')
+                except UnicodeDecodeError:
+                    try:
+                        return blob_data.decode('utf-8', errors='ignore')
+                    except Exception:
+                        return None
+            
+            return None
+        except Exception:
+            return None
+
+    def _get_file_content(
+        self,
+        file_path: str,
+        repo_path: str,
+        commits: List[CommitInfo],
+        git_repo: Optional[Repo]
+    ) -> Tuple[Optional[str], str]:
+        """获取文件内容
+        
+        优先尝试从工作树读取，如果不存在则从最近的 commit 的 tree object 读取。
+        
+        Returns:
+            (content, source) - content 可能为 None，source 标识来源
+        """
+        full_path = Path(repo_path) / file_path
+        if full_path.exists():
+            try:
+                content = full_path.read_text(encoding="utf-8", errors="ignore")
+                return (content, "working_tree")
+            except Exception:
+                pass
+        
+        if git_repo and commits:
+            sorted_commits = sorted(
+                commits,
+                key=lambda c: c.date,
+                reverse=True
+            )
+            for commit_info in sorted_commits:
+                content = self._read_file_from_tree(
+                    git_repo,
+                    commit_info.commit_hash,
+                    file_path
+                )
+                if content is not None:
+                    return (content, f"tree:{commit_info.short_hash}")
+        
+        return (None, "not_found")
+
     def _analyze_contract_file(
         self,
         file_path: str,
         repo_path: str,
-        commits: List[CommitInfo]
+        commits: List[CommitInfo],
+        git_repo: Optional[Repo] = None
     ) -> Optional[ContractChange]:
-        """分析 API 契约文件"""
-        full_path = Path(repo_path) / file_path
+        """分析 API 契约文件
         
-        if not full_path.exists():
+        优先从工作树读取文件，如果文件不在工作树中（例如来自其他分支的 commit），
+        则从 commit 的 tree object 中读取。
+        """
+        content, source = self._get_file_content(file_path, repo_path, commits, git_repo)
+        path_obj = Path(file_path)
+        
+        if content is None:
             return ContractChange(
                 file_path=file_path,
                 change_type="deleted",
                 breaking=True,
-                description="文件已被删除",
+                description=f"无法读取文件（工作树及相关 commit 中都未找到）",
                 affected_items=[file_path],
             )
 
-        try:
-            content = full_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return ContractChange(
-                file_path=file_path,
-                change_type="modified",
-                description="无法读取文件内容",
-                affected_items=[file_path],
-            )
-
-        suffix = full_path.suffix.lower()
+        suffix = path_obj.suffix.lower()
         affected_items = []
         breaking = False
         change_type = "modified"
+
+        if source.startswith("tree:"):
+            change_type = "modified"
 
         if suffix in (".proto",):
             affected_items = self._parse_proto_contract(content)
@@ -166,43 +273,43 @@ class ChangeDetector:
                 breaking = True
                 break
 
+        description = f"涉及 {len(affected_items)} 个 API 定义变更"
+        if source.startswith("tree:"):
+            description += f" (从 commit {source.split(':')[1]} 的 tree 中读取)"
+
         return ContractChange(
             file_path=file_path,
             change_type=change_type,
             affected_items=affected_items,
             breaking=breaking,
-            description=f"涉及 {len(affected_items)} 个 API 定义变更",
+            description=description,
         )
 
     def _analyze_model_file(
         self,
         file_path: str,
         repo_path: str,
-        commits: List[CommitInfo]
+        commits: List[CommitInfo],
+        git_repo: Optional[Repo] = None
     ) -> Optional[ModelChange]:
-        """分析共享模型文件"""
-        full_path = Path(repo_path) / file_path
+        """分析共享模型文件
         
-        if not full_path.exists():
+        优先从工作树读取文件，如果文件不在工作树中（例如来自其他分支的 commit），
+        则从 commit 的 tree object 中读取。
+        """
+        content, source = self._get_file_content(file_path, repo_path, commits, git_repo)
+        path_obj = Path(file_path)
+        
+        if content is None:
             return ModelChange(
                 file_path=file_path,
                 change_type="deleted",
                 breaking=True,
-                description="模型文件已被删除",
+                description="无法读取模型文件（工作树及相关 commit 中都未找到）",
                 affected_models=[file_path],
             )
 
-        try:
-            content = full_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return ModelChange(
-                file_path=file_path,
-                change_type="modified",
-                description="无法读取文件内容",
-                affected_models=[file_path],
-            )
-
-        suffix = full_path.suffix.lower()
+        suffix = path_obj.suffix.lower()
         affected_models = []
         breaking = False
 
@@ -349,15 +456,27 @@ class ChangeDetector:
     def detect_all_changes(
         self,
         scan_results: List[RepoScanResult],
-        repo_paths: Dict[str, str]
+        repo_paths: Dict[str, str],
+        git_repos: Optional[Dict[str, Any]] = None
     ) -> Dict[str, ChangeAnalysis]:
-        """批量检测所有仓库的变更"""
+        """批量检测所有仓库的变更
+        
+        Args:
+            scan_results: 仓库扫描结果列表
+            repo_paths: 仓库名称到路径的映射
+            git_repos: 仓库名称到 GitPython Repo 对象的映射（可选）
+                      用于从 commit tree object 中读取不在工作树中的文件
+        """
         all_analysis: Dict[str, ChangeAnalysis] = {}
+        
+        if git_repos is None:
+            git_repos = {}
         
         for result in scan_results:
             if result.has_changes:
                 repo_path = repo_paths.get(result.repo_name, "")
-                analysis = self.detect_changes(result, repo_path)
+                git_repo = git_repos.get(result.repo_name)
+                analysis = self.detect_changes(result, repo_path, git_repo)
                 all_analysis[result.repo_name] = analysis
         
         return all_analysis

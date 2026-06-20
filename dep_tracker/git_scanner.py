@@ -105,15 +105,107 @@ class GitScanner:
         return False
 
     def _get_changed_files(self, commit) -> List[str]:
-        """获取提交修改的文件列表"""
+        """获取提交修改的文件列表
+        
+        基于 commit 的 tree object 进行分析，不依赖当前工作树。
+        能够正确处理跨分支、跨提交的所有类型的文件变更。
+        """
+        changed_files: List[str] = []
+        
         try:
             if commit.parents:
-                diff = commit.parents[0].diff(commit)
+                for parent in commit.parents:
+                    try:
+                        diff_index = parent.diff(commit)
+                        for diff_item in diff_index:
+                            file_path = self._resolve_diff_item_path(diff_item)
+                            if file_path and file_path not in changed_files:
+                                changed_files.append(file_path)
+                    except Exception:
+                        continue
             else:
-                diff = commit.diff()
-            return [item.a_path for item in diff]
+                changed_files = self._list_all_files_from_tree(commit.tree)
         except Exception:
-            return []
+            try:
+                changed_files = self._get_changed_files_via_git_cmd(commit)
+            except Exception:
+                pass
+        
+        return list(set(changed_files))
+
+    def _resolve_diff_item_path(self, diff_item) -> Optional[str]:
+        """解析 diff 项中的文件路径，处理各种变更类型"""
+        try:
+            change_type = diff_item.change_type
+            
+            if change_type in ('A', 'M', 'T'):
+                return diff_item.b_path if diff_item.b_path else diff_item.a_path
+            
+            if change_type in ('D',):
+                return diff_item.a_path if diff_item.a_path else diff_item.b_path
+            
+            if change_type in ('R',):
+                return diff_item.b_path if diff_item.b_path else diff_item.a_path
+            
+            if change_type in ('C',):
+                return diff_item.b_path if diff_item.b_path else diff_item.a_path
+            
+            if diff_item.b_path:
+                return diff_item.b_path
+            if diff_item.a_path:
+                return diff_item.a_path
+        except Exception:
+            try:
+                return diff_item.b_path or diff_item.a_path
+            except Exception:
+                return None
+        return None
+
+    def _list_all_files_from_tree(self, tree) -> List[str]:
+        """从 git tree 对象中递归列出所有文件"""
+        files = []
+        
+        try:
+            for item in tree.traverse():
+                try:
+                    if item.type == 'blob':
+                        files.append(item.path)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        
+        return files
+
+    def _get_changed_files_via_git_cmd(self, commit) -> List[str]:
+        """通过 git 命令行获取变更文件（后备方案）"""
+        files = []
+        
+        try:
+            repo = commit.repo
+            commit_hash = commit.hexsha
+            
+            if commit.parents:
+                parent_hash = commit.parents[0].hexsha
+                result = repo.git.diff(
+                    '--name-only', '--no-renames',
+                    f'{parent_hash}..{commit_hash}'
+                )
+            else:
+                result = repo.git.show(
+                    '--pretty=format:', '--name-only', '--no-renames',
+                    commit_hash
+                )
+            
+            if result:
+                for line in result.strip().split('\n'):
+                    line = line.strip()
+                    if line and line not in files:
+                        files.append(line)
+        except Exception:
+            pass
+        
+        return files
 
     def scan_repository(
         self,
@@ -121,7 +213,7 @@ class GitScanner:
         issue_id: str,
         max_commits: int = 100
     ) -> RepoScanResult:
-        """扫描单个仓库"""
+        """扫描单个仓库（包括所有分支）"""
         result = RepoScanResult(
             repo_name=repo_config.name,
             repo_path=repo_config.path,
@@ -134,32 +226,43 @@ class GitScanner:
             return result
 
         try:
-            matching_commits = []
+            matching_commits: Dict[str, CommitInfo] = {}
             
-            for commit in repo.iter_commits(max_count=max_commits):
-                if self._match_issue_id(commit.message, issue_id):
-                    changed_files = self._get_changed_files(commit)
-                    
-                    commit_info = CommitInfo(
-                        repo_name=repo_config.name,
-                        commit_hash=commit.hexsha,
-                        short_hash=commit.hexsha[:7],
-                        message=commit.message.strip(),
-                        author=f"{commit.author.name} <{commit.author.email}>",
-                        date=datetime.fromtimestamp(commit.committed_date),
-                        changed_files=changed_files,
-                    )
-                    matching_commits.append(commit_info)
+            all_refs = self._get_all_commit_refs(repo)
+            
+            for ref in all_refs:
+                try:
+                    commit_iter = repo.iter_commits(ref, max_count=max_commits)
+                    for commit in commit_iter:
+                        if commit.hexsha in matching_commits:
+                            continue
+                        
+                        if self._match_issue_id(commit.message, issue_id):
+                            changed_files = self._get_changed_files(commit)
+                            
+                            commit_info = CommitInfo(
+                                repo_name=repo_config.name,
+                                commit_hash=commit.hexsha,
+                                short_hash=commit.hexsha[:7],
+                                message=commit.message.strip(),
+                                author=f"{commit.author.name} <{commit.author.email}>",
+                                date=datetime.fromtimestamp(commit.committed_date),
+                                changed_files=changed_files,
+                            )
+                            matching_commits[commit.hexsha] = commit_info
 
-                    for file_path in changed_files:
-                        if self._match_file_patterns(file_path, repo_config.api_contract_patterns):
-                            if file_path not in result.api_contract_changes:
-                                result.api_contract_changes.append(file_path)
-                        if self._match_file_patterns(file_path, repo_config.shared_model_patterns):
-                            if file_path not in result.shared_model_changes:
-                                result.shared_model_changes.append(file_path)
+                            for file_path in changed_files:
+                                if self._match_file_patterns(file_path, repo_config.api_contract_patterns):
+                                    if file_path not in result.api_contract_changes:
+                                        result.api_contract_changes.append(file_path)
+                                if self._match_file_patterns(file_path, repo_config.shared_model_patterns):
+                                    if file_path not in result.shared_model_changes:
+                                        result.shared_model_changes.append(file_path)
+                except Exception:
+                    continue
 
-            result.commits = matching_commits
+            result.commits = list(matching_commits.values())
+            result.commits.sort(key=lambda c: c.date, reverse=True)
 
         except GitCommandError as e:
             result.error = f"Git 命令执行失败: {str(e)}"
@@ -167,6 +270,60 @@ class GitScanner:
             result.error = f"扫描出错: {str(e)}"
 
         return result
+
+    def _get_all_commit_refs(self, repo) -> List[str]:
+        """获取所有需要扫描的 refs（分支、标签等）"""
+        refs = []
+        
+        try:
+            refs.append('HEAD')
+        except Exception:
+            pass
+        
+        try:
+            for branch in repo.branches:
+                try:
+                    ref_name = branch.name
+                    if ref_name not in refs:
+                        refs.append(ref_name)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        
+        try:
+            remote_refs = []
+            for remote in repo.remotes:
+                try:
+                    for ref in remote.refs:
+                        try:
+                            remote_refs.append(ref.name)
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            
+            for ref in remote_refs:
+                if ref not in refs:
+                    refs.append(ref)
+        except Exception:
+            pass
+        
+        try:
+            for tag in repo.tags:
+                try:
+                    tag_ref = tag.name
+                    if tag_ref not in refs:
+                        refs.append(tag_ref)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        
+        if not refs:
+            refs = ['--all']
+        
+        return refs
 
     def scan_repositories(
         self,
@@ -203,6 +360,25 @@ class GitScanner:
 
         results.sort(key=lambda r: r.repo_name)
         return results
+
+    def get_all_repos(self) -> Dict[str, Repo]:
+        """获取所有仓库的 Git Repo 对象
+        
+        Returns:
+            仓库名称到 GitPython Repo 对象的映射
+        """
+        return dict(self._repo_cache)
+
+    def get_repo_by_path(self, repo_path: str) -> Optional[Repo]:
+        """根据路径获取仓库对象
+        
+        Args:
+            repo_path: 仓库路径
+        
+        Returns:
+            GitPython Repo 对象，如果不存在返回 None
+        """
+        return self._repo_cache.get(repo_path)
 
     def close(self):
         """关闭资源"""
